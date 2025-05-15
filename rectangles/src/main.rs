@@ -29,7 +29,14 @@ fn main() {
         width: 15,
         height: 23,
     };
-    println!("Can rect hold rect2 ? {}",rect.can_hold(&rect2))
+    println!("Can rect hold rect2 ? {}",rect.can_hold(&rect2));
+
+    let mut v = vec![1,2,3,4,5];
+    v.push(3);
+
+    let first = &v[0];
+    println!("The first element is {first}");
+
 }
 
 
