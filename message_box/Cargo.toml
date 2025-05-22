@@ -3,6 +3,9 @@ name = "message_box"
 version = "0.1.0"
 edition = "2024"
 
+[dependencies]
+sysinfo = "0.35.1"
+
 [dependencies.windows]
  version = "0.43.0"
  features = [
