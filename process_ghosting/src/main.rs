@@ -1,3 +1,5 @@
+//Référence : https://whokilleddb.github.io/blogs/posts/process-ghosting/
+
 use std::{
     env,
     fs,
@@ -61,7 +63,6 @@ unsafe fn prepare_target(cible:&str) -> Option<(PVOID,u32)>{
     }
     println!("[+] Création du fichier: {cible}");
 
-    //cette partie la je m'arrache le crâne je comprends pas pourquoi je dois faire ça
     let mut io_status: IO_STATUS_BLOCK = unsafe{zeroed()};
 
     let mut f_fileinfo = FILE_DISPOSITION_INFO {
@@ -70,7 +71,7 @@ unsafe fn prepare_target(cible:&str) -> Option<(PVOID,u32)>{
     let status: NTSTATUS = unsafe{NtSetInformationFile(
         h_file,
         &mut io_status,
-        &mut f_fileinfo as *mut _ as *mut _,
+        &mut f_fileinfo as *mut _ as *mut _, //pour quoi as mut as mut wtf
         size_of::<FILE_DISPOSITION_INFO>() as u32,
         FileDispositionInformation,
     )};
