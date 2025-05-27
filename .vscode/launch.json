@@ -1,16 +1,17 @@
 {
-    // Use IntelliSense to learn about possible attributes.
-    // Hover to view descriptions of existing attributes.
-    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
-    "version": "0.2.0",
-    "configurations": [
-        {
-            "type": "lldb",
-            "request": "launch",
-            "name": "Debug",
-            "program": "${workspaceFolder}/message_box/target/debug/message_box.exe",
-            "args": [],
-            "cwd": "${workspaceFolder}"
-        }
-    ]
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Debug process_ghosting",
+      "type": "lldb",
+      "request": "launch",
+      "program": "${workspaceFolder}/process_ghosting/target/debug/process_ghosting.exe",
+      "args": [
+        "C:\\Dev\\Rust\\test.tmp",
+        "C:\\Dev\\Rust\\demo.exe"
+      ],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal"
+    }
+  ]
 }

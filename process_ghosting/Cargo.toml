@@ -1,8 +1,30 @@
 [package]
 name = "process_ghosting"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
+authors = ["eiden"]
+readme = "Portage Rust de https://raw.githubusercontent.com/whokilleddb/ghosted/refs/heads/main/src/ghosted.c avec des inspirations du code Rust https://github.com/Whitecat18/Rust-for-Malware-Development/tree/main/GhostingProcess (surtout pour le débuggage) "
 
-[dependencies]
-winapi = { version = "0.3.9", features = ["synchapi","winuser", "fileapi", "errhandlingapi", "winbase", "memoryapi", "processenv", "userenv","handleapi", "winnt" ] }
-ntapi = "0.4.1"
+
+[dependencies.winapi]
+version = "0.3.9"
+features = [
+  # pour CreateFileA, CreateFileMappingA, etc.
+  "fileapi", "winbase", "memoryapi",  
+  # pour GetLastError, CloseHandle
+  "errhandlingapi", "handleapi",       
+  # pour VirtualAllocEx, WriteProcessMemory
+  "winnt",                              
+  # pour ReadProcessMemory, WriteProcessMemory
+  "processthreadsapi",  
+  # énumérer modules :
+  # "psapi",            
+  # pour ProcessIdToSessionId, GetProcessId
+  "processthreadsapi",
+  # WaitForSingleObject
+  "synchapi",                           
+  # selon usage 
+  "userenv", "processenv",
+]
+[dependencies.ntapi]
+version = "0.4.1"
