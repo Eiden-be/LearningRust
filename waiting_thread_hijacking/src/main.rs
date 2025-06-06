@@ -21,6 +21,9 @@ use ntapi::ntexapi::*;
 
 impl std::error::Error for Error {}
 
+mod shellcode;
+use shellcode::SHELLCODE;
+
 #[derive(Debug)]
 pub enum Error {
     /// Code NTSTATUS retourné par un appel Nt* (< 0 signifie échec).
