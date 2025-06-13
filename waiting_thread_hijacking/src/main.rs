@@ -145,7 +145,7 @@ fn get_process_thread(pid:DWORD,threads_info:& mut HashMap<DWORD,ThreadInfo>)-> 
                     wait_time: ti.WaitTime 
                 }
             };
-            threads_info.insert(pid, thread_info);
+            threads_info.insert(tid, thread_info);
         }
     }       
     Ok(())
